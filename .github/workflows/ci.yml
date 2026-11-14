@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    name: Typecheck, Build & Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck packages
+        run: pnpm typecheck
+
+      - name: Build packages
+        run: pnpm build
+
+      - name: Run unit tests (root & per-package)
+        run: |
+          pnpm exec vitest run
+          pnpm -r test
+
+      - name: Verify built ESM and CJS dist artifacts
+        run: |
+          node -e '
+          const clientEsm = await import("./packages/client/dist/index.js");
+          const reactEsm = await import("./packages/react/dist/index.js");
+          const { createRequire } = await import("node:module");
+          const require = createRequire(import.meta.url);
+          const clientCjs = require("./packages/client/dist/index.cjs");
+          const reactCjs = require("./packages/react/dist/index.cjs");
+          const kp = await clientEsm.generateDPoPKeyPair();
+          const proof = await clientEsm.signDPoPProof({ keyPair: kp, htm: "GET", htu: "https://alice.wolin.id/profile/card" });
+          const verified = await clientCjs.verifyDPoPProof(proof, { htm: "GET", htu: "https://alice.wolin.id/profile/card" });
+          if (verified.jkt !== kp.jkt || typeof reactEsm.WolinProvider !== "function" || typeof reactCjs.usePodResource !== "function") {
+            throw new Error("Dist artifact verification failed");
+          }
+          '

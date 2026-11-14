@@ -1,0 +1,45 @@
+{
+  "name": "@wolin-id/sdk-js",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Official Wolin TypeScript/JavaScript SDK monorepo for W3C Solid Pods, Solid-OIDC, and RFC 9449 DPoP",
+  "type": "module",
+  "license": "MIT OR Apache-2.0",
+  "author": "Entropy Paradox, Inc. (https://wolin.id)",
+  "homepage": "https://wolin.id",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wolin-id/sdk-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wolin-id/sdk-js/issues"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "build": "pnpm --filter @wolin-id/client build && pnpm --filter @wolin-id/react build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "pnpm -r clean"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.0",
+    "@types/node": "^22.13.10",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "jsdom": "^26.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.8"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

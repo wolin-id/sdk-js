@@ -291,4 +291,31 @@ describe('@wolin-id/client — WolinPodClient LDP CRUD, DPoP & ETag Support', ()
       WolinHttpError,
     );
   });
+
+  it('invokes globalThis.fetch without leaking WolinPodClient as receiver (Browser Window WebIDL brand safety)', async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async function strictWindowFetch(
+        this: unknown,
+        _input: RequestInfo | URL,
+      ): Promise<Response> {
+        if (this !== undefined && this !== globalThis) {
+          throw new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation");
+        }
+        return new Response('<#ok> a <#Pass> .', {
+          status: 200,
+          headers: { 'Content-Type': 'text/turtle', ETag: '"etag-browser-1"' },
+        });
+      } as typeof fetch;
+
+      const defaultFetchClient = new WolinPodClient({
+        podUrl: 'https://alice.wolin.id/',
+      });
+      const res = await defaultFetchClient.getResource('/public/card.ttl');
+      expect(res.etag).toBe('"etag-browser-1"');
+      expect(res.text()).toContain('<#Pass>');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

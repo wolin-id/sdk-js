@@ -855,7 +855,10 @@ export async function fetchWebIdProfile(
 
   parsedUrl.hash = '';
   const documentIri = parsedUrl.toString();
-  const fetchImpl = options?.fetchFn ?? globalThis.fetch;
+  const customFetch = options?.fetchFn;
+  const fetchImpl: typeof fetch = customFetch
+    ? (input, init) => customFetch(input, init)
+    : (input, init) => globalThis.fetch(input, init);
 
   const response = await fetchImpl(documentIri, {
     method: 'GET',

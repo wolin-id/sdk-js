@@ -286,7 +286,10 @@ export class WolinPodClient {
         : 'Bearer';
     this.allowCrossOriginAuth = options.allowCrossOriginAuth ?? false;
     this.dpopNonce = options.dpopNonce;
-    this.fetchImpl = options.fetchFn ?? globalThis.fetch;
+    const customFetch = options.fetchFn;
+    this.fetchImpl = customFetch
+      ? (input, init) => customFetch(input, init)
+      : (input, init) => globalThis.fetch(input, init);
   }
 
   public resolveUrl(target: string | URL): string {

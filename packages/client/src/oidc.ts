@@ -167,6 +167,12 @@ export async function generatePkcePair(byteLength = 32): Promise<PkcePair> {
   };
 }
 
+function resolveFetch(customFetch?: typeof fetch): typeof fetch {
+  return customFetch
+    ? (input, init) => customFetch(input, init)
+    : (input, init) => globalThis.fetch(input, init);
+}
+
 /**
  * Discover Solid-OIDC provider metadata from `<issuer>/.well-known/openid-configuration`
  * and verify that the returned `issuer` and endpoints match security invariants.
@@ -175,7 +181,7 @@ export async function discoverOidcProvider(
   issuerUrl: string,
   options?: { fetchFn?: typeof fetch },
 ): Promise<OidcProviderMetadata> {
-  const fetchImpl = options?.fetchFn ?? globalThis.fetch;
+  const fetchImpl = resolveFetch(options?.fetchFn);
   const parsedIssuer = assertValidIssuerUrl(issuerUrl.trim(), 'OIDC issuer');
   const base = parsedIssuer.toString().replace(/\/+$/, '');
   const discoveryUrl = `${base}/.well-known/openid-configuration`;
@@ -588,7 +594,7 @@ export async function exchangeCodeForTokens(
     params.set('client_secret', options.clientSecret);
   }
 
-  const fetchImpl = options.fetchFn ?? globalThis.fetch;
+  const fetchImpl = resolveFetch(options.fetchFn);
   return postTokenRequestWithDPoP(
     options.tokenEndpoint,
     params,
@@ -623,7 +629,7 @@ export async function refreshSolidTokens(options: RefreshTokenOptions): Promise<
     params.set('scope', options.scopes.join(' '));
   }
 
-  const fetchImpl = options.fetchFn ?? globalThis.fetch;
+  const fetchImpl = resolveFetch(options.fetchFn);
   return postTokenRequestWithDPoP(
     options.tokenEndpoint,
     params,

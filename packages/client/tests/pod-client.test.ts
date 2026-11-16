@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   generateDPoPKeyPair,
   LDP_BASIC_CONTAINER_IRI,
+  LDP_NON_RDF_SOURCE_IRI,
   verifyDPoPProof,
+  WolinAuthError,
+  WolinClient,
   WolinHttpError,
   WolinPodClient,
   WolinPreconditionError,
@@ -317,5 +320,160 @@ describe('@wolin-id/client — WolinPodClient LDP CRUD, DPoP & ETag Support', ()
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  it('follows 302 signed R2/CDN asset redirects cleanly via get / getBlob / WolinClient without leaking Authorization or DPoP headers', async () => {
+    const keyPair = await generateDPoPKeyPair();
+    const secretToken = 'secret-dpop-access-token-never-leak';
+    const glbBytes = new Uint8Array([0x67, 0x6c, 0x54, 0x46, 0x02, 0x00, 0x00, 0x00]);
+    const signedUrl =
+      'https://auth.wolin.id/assets/alice/public/avatar.glb?exp=1893456000&sig=' +
+      'a'.repeat(64);
+
+    const mockFetch = vi
+      .fn<typeof fetch>()
+      // 1st hop: Pod Engine verifies DPoP & returns 302 Found to signed Edge/R2 URL
+      .mockImplementationOnce(async (input, init) => {
+        expect(String(input)).toBe('https://alice.wolin.id/public/avatar.glb');
+        expect(init?.redirect).toBe('manual');
+        const headers = new Headers(init?.headers);
+        expect(headers.get('Authorization')).toBe(`DPoP ${secretToken}`);
+        expect(headers.get('DPoP')).toBeTruthy();
+
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: signedUrl,
+            ETag: '"etag-glb-pod"',
+            Link: `<http://www.w3.org/ns/ldp#Resource>; rel="type", <${LDP_NON_RDF_SOURCE_IRI}>; rel="type"`,
+          },
+        });
+      })
+      // 2nd hop: Signed R2/CDN URL MUST NOT receive Authorization or DPoP headers
+      .mockImplementationOnce(async (input, init) => {
+        expect(String(input)).toBe(signedUrl);
+        const headers = new Headers(init?.headers);
+        expect(headers.get('Authorization')).toBeNull();
+        expect(headers.get('DPoP')).toBeNull();
+        expect(headers.get('Cookie')).toBeNull();
+
+        return new Response(glbBytes, {
+          status: 200,
+          headers: {
+            'Content-Type': 'model/gltf-binary',
+            ETag: '"etag-glb-r2"',
+          },
+        });
+      })
+      // Repeat for getBlob(): 302 -> same-origin presigned URL (still strips credentials!)
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 302,
+          headers: {
+            Location:
+              'https://alice.wolin.id/assets/alice/public/avatar.glb?exp=1893456000&sig=' +
+              'b'.repeat(64),
+          },
+        }),
+      )
+      .mockImplementationOnce(async (_input, init) => {
+        const headers = new Headers(init?.headers);
+        expect(headers.get('Authorization')).toBeNull();
+        expect(headers.get('DPoP')).toBeNull();
+        return new Response(glbBytes, {
+          status: 200,
+          headers: { 'Content-Type': 'model/gltf-binary' },
+        });
+      });
+
+    const client = new WolinClient({
+      podUrl: 'https://alice.wolin.id/',
+      accessToken: secretToken,
+      dpopKeyPair: keyPair,
+      fetchFn: mockFetch,
+    });
+
+    const res = await client.get('/public/avatar.glb');
+    expect(res.status).toBe(200);
+    expect(res.url).toBe('https://alice.wolin.id/public/avatar.glb');
+    expect(res.redirectedUrl).toBe(signedUrl);
+    expect(res.etag).toBe('"etag-glb-r2"');
+    expect(res.contentType).toBe('model/gltf-binary');
+    expect(res.linkTypes).toContain(LDP_NON_RDF_SOURCE_IRI);
+    expect(res.bytes).toEqual(glbBytes);
+
+    const blob = await client.getBlob('/public/avatar.glb');
+    expect(blob.type).toBe('model/gltf-binary');
+    expect(new Uint8Array(await blob.arrayBuffer())).toEqual(glbBytes);
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+  });
+
+  it('blocks HTTPS -> HTTP downgrade on 302 asset redirects and re-signs DPoP on same-origin non-presigned redirects', async () => {
+    const keyPair = await generateDPoPKeyPair();
+    const mockFetch = vi
+      .fn<typeof fetch>()
+      // 1. HTTPS -> HTTP downgrade must fail closed before following
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 302,
+          headers: { Location: 'http://cdn.wolin.id/assets/alice/avatar.glb?exp=1&sig=2' },
+        }),
+      )
+      // 2. Same-origin Solid container trailing-slash 301 within /pods/alice/ re-signs DPoP with updated htu
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 301,
+          headers: { Location: '/pods/alice/private/docs/' },
+        }),
+      )
+      .mockImplementationOnce(async (input, init) => {
+        expect(String(input)).toBe('https://pod.wolin.id/pods/alice/private/docs/');
+        const headers = new Headers(init?.headers);
+        expect(headers.get('Authorization')).toBe('DPoP tok-same-origin');
+        const verified = await verifyDPoPProof(headers.get('DPoP')!, {
+          htm: 'GET',
+          htu: 'https://pod.wolin.id/pods/alice/private/docs/',
+          accessToken: 'tok-same-origin',
+        });
+        expect(verified.jkt).toBe(keyPair.jkt);
+        return new Response('<#ok> a <#Container> .', {
+          status: 200,
+          headers: { 'Content-Type': 'text/turtle' },
+        });
+      })
+      // 3. Same-origin redirect escaping /pods/alice/ to /pods/bob/ on shared pod.wolin.id strips credentials!
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 302,
+          headers: { Location: '/pods/bob/public/readme.ttl' },
+        }),
+      )
+      .mockImplementationOnce(async (input, init) => {
+        expect(String(input)).toBe('https://pod.wolin.id/pods/bob/public/readme.ttl');
+        const headers = new Headers(init?.headers);
+        expect(headers.get('Authorization')).toBeNull();
+        expect(headers.get('DPoP')).toBeNull();
+        return new Response('<#bob> a <#Public> .', {
+          status: 200,
+          headers: { 'Content-Type': 'text/turtle' },
+        });
+      });
+
+    const client = new WolinPodClient({
+      podUrl: 'https://pod.wolin.id/pods/alice/',
+      accessToken: 'tok-same-origin',
+      dpopKeyPair: keyPair,
+      fetchFn: mockFetch,
+    });
+
+    await expect(client.get('/public/avatar.glb')).rejects.toThrow(WolinAuthError);
+
+    const sameOriginRes = await client.get('/private/docs');
+    expect(sameOriginRes.status).toBe(200);
+    expect(sameOriginRes.redirectedUrl).toBe('https://pod.wolin.id/pods/alice/private/docs/');
+
+    const crossPodRes = await client.get('/public/link-to-bob');
+    expect(crossPodRes.status).toBe(200);
+    expect(mockFetch).toHaveBeenCalledTimes(5);
   });
 });

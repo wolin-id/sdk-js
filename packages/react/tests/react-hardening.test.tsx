@@ -40,10 +40,10 @@ describe('@wolin-id/react — Security & Concurrency Hardening', () => {
           { status: 200, headers: { 'Content-Type': 'application/json' } },
         ),
       )
-      // Victim's WebID profile only authorizes https://id.wolin.id
+      // Victim's WebID profile only authorizes https://auth.wolin.id
       .mockResolvedValueOnce(
         new Response(
-          '<#me> <http://www.w3.org/ns/solid/terms#oidcIssuer> <https://id.wolin.id> .',
+          '<#me> <http://www.w3.org/ns/solid/terms#oidcIssuer> <https://auth.wolin.id> .',
           { status: 200, headers: { 'Content-Type': 'text/turtle' } },
         ),
       );
@@ -168,7 +168,7 @@ describe('@wolin-id/react — Security & Concurrency Hardening', () => {
       )
       .mockResolvedValueOnce(
         new Response(
-          '<#me> <http://www.w3.org/ns/solid/terms#oidcIssuer> <https://id.wolin.id> .',
+          '<#me> <http://www.w3.org/ns/solid/terms#oidcIssuer> <https://auth.wolin.id> .',
           { status: 200, headers: { 'Content-Type': 'text/turtle' } },
         ),
       );

@@ -1,5 +1,6 @@
 import {
   createSolidAuthRequest,
+  DEFAULT_WOLIN_OIDC_ISSUER,
   type DPoPKeyPair,
   decodeJwtPayload,
   discoverOidcProvider,
@@ -40,7 +41,7 @@ export interface WolinSessionState {
 }
 
 export interface LoginOptions {
-  /** Explicit Solid-OIDC issuer URL (e.g. `https://id.wolin.id`). */
+  /** Explicit Solid-OIDC issuer URL (e.g. `https://auth.wolin.id`). */
   oidcIssuer?: string;
   /** User WebID URI from which `solid:oidcIssuer` can be discovered automatically. */
   webId?: string;
@@ -91,6 +92,7 @@ export interface WolinProviderProps {
   initialSession?: WolinSessionState | null;
   clientId?: string;
   redirectUri?: string;
+  /** Fallback Solid-OIDC issuer URL when not discovered via WebID (defaults to `https://auth.wolin.id`). */
   defaultOidcIssuer?: string;
   podUrl?: string;
   fetchFn?: typeof fetch;
@@ -119,7 +121,7 @@ export function WolinProvider({
   initialSession = null,
   clientId: defaultClientId,
   redirectUri: defaultRedirectUri,
-  defaultOidcIssuer,
+  defaultOidcIssuer = DEFAULT_WOLIN_OIDC_ISSUER,
   podUrl: defaultPodUrl,
   fetchFn,
   onSessionChange,

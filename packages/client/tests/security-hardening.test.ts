@@ -78,10 +78,10 @@ describe('@wolin-id/client — Security & Protocol Hardening Regression Suite', 
 
     // Reject # or ? in issuerUrl before fetching
     await expect(
-      discoverOidcProvider('https://id.wolin.id/pods/evil/fake.json#', { fetchFn: mockFetch }),
+      discoverOidcProvider('https://auth.wolin.id/pods/evil/fake.json#', { fetchFn: mockFetch }),
     ).rejects.toThrow(WolinAuthError);
     await expect(
-      discoverOidcProvider('https://id.wolin.id?redirect=1', { fetchFn: mockFetch }),
+      discoverOidcProvider('https://auth.wolin.id?redirect=1', { fetchFn: mockFetch }),
     ).rejects.toThrow(WolinAuthError);
     expect(mockFetch).not.toHaveBeenCalled();
 
@@ -89,21 +89,21 @@ describe('@wolin-id/client — Security & Protocol Hardening Regression Suite', 
     mockFetch.mockResolvedValueOnce(
       new Response(
         JSON.stringify({
-          issuer: 'https://id.wolin.id',
-          authorization_endpoint: 'https://id.wolin.id/auth',
-          token_endpoint: 'http://id.wolin.id/token',
+          issuer: 'https://auth.wolin.id',
+          authorization_endpoint: 'https://auth.wolin.id/auth',
+          token_endpoint: 'http://auth.wolin.id/token',
         }),
         { status: 200, headers: { 'Content-Type': 'application/json' } },
       ),
     );
     await expect(
-      discoverOidcProvider('https://id.wolin.id', { fetchFn: mockFetch }),
+      discoverOidcProvider('https://auth.wolin.id', { fetchFn: mockFetch }),
     ).rejects.toThrow(WolinAuthError);
 
     // Reject empty OAuth state
     await expect(
       createSolidAuthRequest({
-        authorizationEndpoint: 'https://id.wolin.id/auth',
+        authorizationEndpoint: 'https://auth.wolin.id/auth',
         clientId: 'https://app.wolin.id/client',
         redirectUri: 'https://app.wolin.id/cb',
         state: '   ',
@@ -113,7 +113,7 @@ describe('@wolin-id/client — Security & Protocol Hardening Regression Suite', 
     // Reject expired id_token and malformed id_token during token exchange
     const kp = await generateDPoPKeyPair();
     const expiredIdToken = makeJwt({
-      iss: 'https://id.wolin.id',
+      iss: 'https://auth.wolin.id',
       sub: 'alice',
       webid: 'https://alice.wolin.id/profile/card#me',
       aud: 'https://app.wolin.id/client',
@@ -131,12 +131,12 @@ describe('@wolin-id/client — Security & Protocol Hardening Regression Suite', 
     );
     await expect(
       exchangeCodeForTokens({
-        tokenEndpoint: 'https://id.wolin.id/token',
+        tokenEndpoint: 'https://auth.wolin.id/token',
         code: 'code-1',
         codeVerifier: 'v'.repeat(43),
         redirectUri: 'https://app.wolin.id/cb',
         clientId: 'https://app.wolin.id/client',
-        expectedIssuer: 'https://id.wolin.id',
+        expectedIssuer: 'https://auth.wolin.id',
         nowEpochSecs: 1_800_000_000,
         dpopKeyPair: kp,
         fetchFn: mockFetch,
@@ -149,7 +149,7 @@ describe('@wolin-id/client — Security & Protocol Hardening Regression Suite', 
     const mockFetch = vi.fn<typeof fetch>();
 
     const client = new WolinPodClient({
-      podUrl: 'https://wolin.id/pods/alice/',
+      podUrl: 'https://pod.wolin.id/pods/alice/',
       accessToken: 'secret-dpop-token',
       dpopKeyPair: kp,
       tokenType: 'dpop', // lowercase normalized to 'DPoP'
@@ -197,10 +197,10 @@ _:b1 <https://example.org/p> "explicit-b1" .
 
     // Canonical uppercase-host WebID + solid:oidcIssuer verification
     const profile = parseWebIdProfile(
-      '<#me> <http://www.w3.org/ns/solid/terms#oidcIssuer> <https://id.wolin.id> .',
+      '<#me> <http://www.w3.org/ns/solid/terms#oidcIssuer> <https://auth.wolin.id> .',
       'https://ALICE.WOLIN.ID/profile/card#me',
     );
-    expect(() => verifyWebIdOidcIssuer(profile, 'https://id.wolin.id')).not.toThrow();
+    expect(() => verifyWebIdOidcIssuer(profile, 'https://auth.wolin.id')).not.toThrow();
     expect(() => verifyWebIdOidcIssuer(profile, 'https://rogue.idp.example')).toThrow(
       WolinAuthError,
     );
@@ -262,10 +262,10 @@ _:b1 <https://example.org/p> "explicit-b1" .
     ).rejects.toThrow(WolinAuthError);
 
     // 3. Mixed dot-encoding (.%2e / %2e.) rejected & /https://... stays relative under Pod
-    const pod = new WolinPodClient({ podUrl: 'https://wolin.id/pods/alice/' });
+    const pod = new WolinPodClient({ podUrl: 'https://pod.wolin.id/pods/alice/' });
     expect(() => pod.resolveUrl('/sandbox/.%2e/secret')).toThrow(WolinError);
     expect(() => pod.resolveUrl('/sandbox/%2e./secret')).toThrow(WolinError);
-    expect(pod.resolveUrl('/https:/note.ttl')).toBe('https://wolin.id/pods/alice/https:/note.ttl');
+    expect(pod.resolveUrl('/https:/note.ttl')).toBe('https://pod.wolin.id/pods/alice/https:/note.ttl');
 
     // 4. tokenType: 'DPoP' without dpopKeyPair fails closed instead of downgrading to Bearer
     const keylessDpopPod = new WolinPodClient({

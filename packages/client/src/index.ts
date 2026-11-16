@@ -65,10 +65,28 @@ export {
   type PostResourceOptions,
   type PutResourceOptions,
   parseLinkHeaderTypes,
+  WolinPodClient as WolinClient,
+  type WolinPodClientOptions as WolinClientOptions,
   WolinPodClient,
   type WolinPodClientOptions,
   type WriteResourceResult,
 } from './pod-client.js';
+
+export {
+  DEFAULT_WOLIN_DOMAIN,
+  DEFAULT_WOLIN_ISSUER,
+  DEFAULT_WOLIN_OIDC_ISSUER,
+  DEFAULT_WOLIN_POD_BASE_URL,
+  isReservedPodId,
+  isValidPodId,
+  MAX_POD_ID_LEN,
+  MIN_POD_ID_LEN,
+  type PodIdValidationResult,
+  RESERVED_POD_ID_LIST,
+  RESERVED_POD_IDS,
+  type ValidatePodIdOptions,
+  validatePodId,
+} from './pod-id.js';
 
 export {
   FOAF_NAME_IRI,

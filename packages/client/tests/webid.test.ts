@@ -25,7 +25,7 @@ const WOLIN_PROFILE_TURTLE = `
     foaf:name "Alice Moon" ;
     vcard:fn "Alice Moon"@en ;
     pim:storage </> , <https://backup.wolin.id/pods/alice/> ;
-    solid:oidcIssuer <https://id.wolin.id> ;
+    solid:oidcIssuer <https://auth.wolin.id> ;
     ldp:inbox </inbox/> ;
     solid:account [
       a solid:Account ;
@@ -43,8 +43,8 @@ describe('@wolin-id/client — WebID Profile & Turtle Parser', () => {
       'https://alice.wolin.id/',
       'https://backup.wolin.id/pods/alice/',
     ]);
-    expect(profile.primaryOidcIssuer).toBe('https://id.wolin.id');
-    expect(profile.oidcIssuers).toEqual(['https://id.wolin.id']);
+    expect(profile.primaryOidcIssuer).toBe('https://auth.wolin.id');
+    expect(profile.oidcIssuers).toEqual(['https://auth.wolin.id']);
     expect(profile.primaryInbox).toBe('https://alice.wolin.id/inbox/');
     expect(profile.inboxes).toEqual(['https://alice.wolin.id/inbox/']);
     expect(profile.name).toBe('Alice Moon');
@@ -87,7 +87,7 @@ Builder""" ;
       }),
     );
     expect(profile.primaryStorage).toBe('https://alice.wolin.id/');
-    expect(profile.primaryOidcIssuer).toBe('https://id.wolin.id');
+    expect(profile.primaryOidcIssuer).toBe('https://auth.wolin.id');
   });
 
   it('extracts ldp:contains children from Solid container Turtle representations', () => {

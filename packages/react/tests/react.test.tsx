@@ -28,9 +28,9 @@ describe('@wolin-id/react — WolinProvider, useWolinSession & usePodResource', 
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            issuer: 'https://id.wolin.id',
-            authorization_endpoint: 'https://id.wolin.id/oauth/v2/authorize',
-            token_endpoint: 'https://id.wolin.id/oauth/v2/token',
+            issuer: 'https://auth.wolin.id',
+            authorization_endpoint: 'https://auth.wolin.id/oauth/v2/authorize',
+            token_endpoint: 'https://auth.wolin.id/oauth/v2/token',
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } },
         ),
@@ -38,14 +38,14 @@ describe('@wolin-id/react — WolinProvider, useWolinSession & usePodResource', 
       // 2. Token exchange
       .mockImplementationOnce(async () => {
         const idToken = makeJwt({
-          iss: 'https://id.wolin.id',
+          iss: 'https://auth.wolin.id',
           sub: 'alice',
           webid: 'https://alice.wolin.id/profile/card#me',
           aud: 'https://app.wolin.id/client',
           exp: 2_000_000_000,
         });
         const accessToken = makeJwt({
-          iss: 'https://id.wolin.id',
+          iss: 'https://auth.wolin.id',
           sub: 'alice',
           webid: 'https://alice.wolin.id/profile/card#me',
           aud: 'solid',
@@ -70,7 +70,7 @@ describe('@wolin-id/react — WolinProvider, useWolinSession & usePodResource', 
 @prefix foaf: <http://xmlns.com/foaf/0.1/> .
 <#me> foaf:name "Alice" ;
       pim:storage <https://alice.wolin.id/> ;
-      solid:oidcIssuer <https://id.wolin.id> .
+      solid:oidcIssuer <https://auth.wolin.id> .
 `,
           { status: 200, headers: { 'Content-Type': 'text/turtle' } },
         ),
@@ -80,7 +80,7 @@ describe('@wolin-id/react — WolinProvider, useWolinSession & usePodResource', 
       <WolinProvider
         clientId="https://app.wolin.id/client"
         redirectUri="https://app.wolin.id/cb"
-        defaultOidcIssuer="https://id.wolin.id"
+        defaultOidcIssuer="https://auth.wolin.id"
         fetchFn={mockFetch}
       >
         {children}
@@ -95,7 +95,7 @@ describe('@wolin-id/react — WolinProvider, useWolinSession & usePodResource', 
     await act(async () => {
       const started = await result.current.login({ redirect: false });
       loginState = started.authRequest.state;
-      expect(started.authRequest.url).toContain('https://id.wolin.id/oauth/v2/authorize');
+      expect(started.authRequest.url).toContain('https://auth.wolin.id/oauth/v2/authorize');
       expect(started.dpopKeyPair.jkt.length).toBeGreaterThan(10);
     });
 

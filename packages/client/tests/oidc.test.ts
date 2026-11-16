@@ -34,7 +34,7 @@ describe('@wolin-id/client — Solid-OIDC Discovery, PKCE & Token Exchange', () 
 
   it('builds a Solid-OIDC PKCE authorization URL with openid & webid scopes', async () => {
     const authReq = await createSolidAuthRequest({
-      authorizationEndpoint: 'https://id.wolin.id/oauth/v2/authorize',
+      authorizationEndpoint: 'https://auth.wolin.id/oauth/v2/authorize',
       clientId: 'https://app.wolin.id/client.jsonld',
       redirectUri: 'https://app.wolin.id/auth/callback',
       state: 'state-xyz-123',
@@ -42,7 +42,7 @@ describe('@wolin-id/client — Solid-OIDC Discovery, PKCE & Token Exchange', () 
     });
 
     const parsed = new URL(authReq.url);
-    expect(parsed.origin + parsed.pathname).toBe('https://id.wolin.id/oauth/v2/authorize');
+    expect(parsed.origin + parsed.pathname).toBe('https://auth.wolin.id/oauth/v2/authorize');
     expect(parsed.searchParams.get('response_type')).toBe('code');
     expect(parsed.searchParams.get('client_id')).toBe('https://app.wolin.id/client.jsonld');
     expect(parsed.searchParams.get('redirect_uri')).toBe('https://app.wolin.id/auth/callback');
@@ -67,21 +67,21 @@ describe('@wolin-id/client — Solid-OIDC Discovery, PKCE & Token Exchange', () 
     const mockFetch = vi.fn<typeof fetch>().mockResolvedValueOnce(
       new Response(
         JSON.stringify({
-          issuer: 'https://id.wolin.id',
-          authorization_endpoint: 'https://id.wolin.id/oauth/v2/authorize',
-          token_endpoint: 'https://id.wolin.id/oauth/v2/token',
+          issuer: 'https://auth.wolin.id',
+          authorization_endpoint: 'https://auth.wolin.id/oauth/v2/authorize',
+          token_endpoint: 'https://auth.wolin.id/oauth/v2/token',
           dpop_signing_alg_values_supported: ['ES256'],
         }),
         { status: 200, headers: { 'Content-Type': 'application/json' } },
       ),
     );
 
-    const metadata = await discoverOidcProvider('https://id.wolin.id/', { fetchFn: mockFetch });
+    const metadata = await discoverOidcProvider('https://auth.wolin.id/', { fetchFn: mockFetch });
     expect(mockFetch).toHaveBeenCalledWith(
-      'https://id.wolin.id/.well-known/openid-configuration',
+      'https://auth.wolin.id/.well-known/openid-configuration',
       expect.objectContaining({ method: 'GET' }),
     );
-    expect(metadata.token_endpoint).toBe('https://id.wolin.id/oauth/v2/token');
+    expect(metadata.token_endpoint).toBe('https://auth.wolin.id/oauth/v2/token');
 
     // Rejects mismatched issuer in discovery document
     mockFetch.mockResolvedValueOnce(
@@ -95,21 +95,21 @@ describe('@wolin-id/client — Solid-OIDC Discovery, PKCE & Token Exchange', () 
       ),
     );
     await expect(
-      discoverOidcProvider('https://id.wolin.id', { fetchFn: mockFetch }),
+      discoverOidcProvider('https://auth.wolin.id', { fetchFn: mockFetch }),
     ).rejects.toThrow(WolinAuthError);
   });
 
   it('exchanges authorization code with DPoP proof and retries automatically on DPoP-Nonce challenge', async () => {
     const dpopKeyPair = await generateDPoPKeyPair();
     const idToken = buildUnsignedTestJwt({
-      iss: 'https://id.wolin.id',
+      iss: 'https://auth.wolin.id',
       sub: 'alice-sub',
       webid: 'https://alice.wolin.id/profile/card#me',
       aud: ['https://app.wolin.id/client.jsonld', 'solid'],
       exp: 2_000_000_000,
     });
     const accessToken = buildUnsignedTestJwt({
-      iss: 'https://id.wolin.id',
+      iss: 'https://auth.wolin.id',
       sub: 'alice-sub',
       webid: 'https://alice.wolin.id/profile/card#me',
       aud: 'solid',
@@ -145,7 +145,7 @@ describe('@wolin-id/client — Solid-OIDC Discovery, PKCE & Token Exchange', () 
       );
 
     const tokenSet = await exchangeCodeForTokens({
-      tokenEndpoint: 'https://id.wolin.id/oauth/v2/token',
+      tokenEndpoint: 'https://auth.wolin.id/oauth/v2/token',
       code: 'auth-code-777',
       codeVerifier: 'verifier-secret-at-least-43-characters-long-for-pkce-s256',
       redirectUri: 'https://app.wolin.id/auth/callback',
@@ -164,7 +164,7 @@ describe('@wolin-id/client — Solid-OIDC Discovery, PKCE & Token Exchange', () 
     const proofPayload = JSON.parse(base64UrlDecodeString(payloadB64)) as Record<string, unknown>;
 
     expect(proofPayload.htm).toBe('POST');
-    expect(proofPayload.htu).toBe('https://id.wolin.id/oauth/v2/token');
+    expect(proofPayload.htu).toBe('https://auth.wolin.id/oauth/v2/token');
     expect(proofPayload.nonce).toBe('idp-fresh-nonce-99');
     expect(proofPayload.ath).toBeUndefined();
 
@@ -185,7 +185,7 @@ describe('@wolin-id/client — Solid-OIDC Discovery, PKCE & Token Exchange', () 
   it('refreshes Solid tokens with a DPoP proof bound to the token endpoint', async () => {
     const dpopKeyPair = await generateDPoPKeyPair();
     const newAccessToken = buildUnsignedTestJwt({
-      iss: 'https://id.wolin.id',
+      iss: 'https://auth.wolin.id',
       sub: 'https://alice.wolin.id/profile/card#me',
       aud: 'solid',
       cnf: { jkt: dpopKeyPair.jkt },
@@ -204,7 +204,7 @@ describe('@wolin-id/client — Solid-OIDC Discovery, PKCE & Token Exchange', () 
     );
 
     const refreshed = await refreshSolidTokens({
-      tokenEndpoint: 'https://id.wolin.id/oauth/v2/token',
+      tokenEndpoint: 'https://auth.wolin.id/oauth/v2/token',
       refreshToken: 'rt-opaque-01',
       clientId: 'https://app.wolin.id/client.jsonld',
       dpopKeyPair,

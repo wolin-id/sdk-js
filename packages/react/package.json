@@ -1,7 +1,7 @@
 {
   "name": "@wolin-id/react",
   "version": "0.1.0",
-  "description": "React hooks and context provider for Wolin Solid Pods (@wolin-id/client)",
+  "description": "React hooks and context provider for Wolin (月印千江) Solid Pods (@wolin-id/client)",
   "type": "module",
   "license": "MIT OR Apache-2.0",
   "author": "Entropy Paradox, Inc. (https://wolin.id)",

@@ -2,7 +2,7 @@
   "name": "@wolin-id/sdk-js",
   "version": "0.1.0",
   "private": true,
-  "description": "Official Wolin TypeScript/JavaScript SDK monorepo for W3C Solid Pods, Solid-OIDC, and RFC 9449 DPoP",
+  "description": "Official Wolin (月印千江) TypeScript/JavaScript SDK monorepo for W3C Solid Pods, Solid-OIDC, and RFC 9449 DPoP",
   "type": "module",
   "license": "MIT OR Apache-2.0",
   "author": "Entropy Paradox, Inc. (https://wolin.id)",

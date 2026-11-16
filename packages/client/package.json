@@ -1,7 +1,7 @@
 {
   "name": "@wolin-id/client",
   "version": "0.1.0",
-  "description": "Zero-dependency W3C Solid Pod client, Solid-OIDC PKCE helper, and RFC 9449 ES256 DPoP signer for Wolin",
+  "description": "Zero-dependency W3C Solid Pod client, Solid-OIDC PKCE helper, and RFC 9449 ES256 DPoP signer for Wolin (月印千江)",
   "type": "module",
   "license": "MIT OR Apache-2.0",
   "author": "Entropy Paradox, Inc. (https://wolin.id)",

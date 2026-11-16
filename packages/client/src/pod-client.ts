@@ -47,6 +47,8 @@ export interface GetResourceOptions {
 
 export interface PodResource {
   url: string;
+  /** Final target URL when an HTTP `301`/`302`/`303`/`307`/`308` redirect (such as a signed R2/CDN asset offload) was followed. */
+  redirectedUrl?: string;
   status: number;
   notModified: boolean;
   etag: string | null;
@@ -256,8 +258,110 @@ function isReplayableBody(body: BodyInit | null | undefined): boolean {
   return true;
 }
 
+const MAX_REDIRECT_HOPS = 5;
+const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
+const SENSITIVE_REDIRECT_HEADERS = [
+  'authorization',
+  'dpop',
+  'cookie',
+  'proxy-authorization',
+] as const;
+
+function isRedirectStatus(status: number): boolean {
+  return REDIRECT_STATUS_CODES.has(status);
+}
+
 /**
- * W3C Solid 0.11 LDP Pod client with native RFC 9449 ES256 DPoP signing and ETag concurrency control.
+ * Detect short-lived HMAC / cloud object-storage presigned URLs (e.g. Wolin Edge `/assets/...?exp=...&sig=...`,
+ * Cloudflare R2 / S3 `X-Amz-Signature`, GCS `X-Goog-Signature`, or Azure SAS) that must never receive
+ * `Authorization` or `DPoP` headers.
+ */
+function isPresignedAssetUrl(parsed: URL): boolean {
+  const params = parsed.searchParams;
+  if (params.has('sig') && (params.has('exp') || params.has('se') || params.has('sv'))) {
+    return true;
+  }
+  for (const key of params.keys()) {
+    const lower = key.toLowerCase();
+    if (
+      lower === 'x-amz-signature' ||
+      lower === 'x-amz-credential' ||
+      lower === 'x-goog-signature' ||
+      lower === 'x-goog-credential'
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function stripSensitiveRedirectHeaders(headers: Headers): void {
+  for (const name of SENSITIVE_REDIRECT_HEADERS) {
+    headers.delete(name);
+  }
+}
+
+function validateRedirectTargetUrl(rawLocation: string, previousUrl: URL): URL {
+  const trimmed = rawLocation.trim();
+  if (!trimmed || /[\x00-\x1f\x7f\\]/.test(trimmed)) {
+    throw new WolinAuthError('Malformed or unsafe HTTP redirect Location header');
+  }
+  let nextUrl: URL;
+  try {
+    nextUrl = new URL(trimmed, previousUrl);
+  } catch (err) {
+    throw new WolinAuthError(`Malformed HTTP redirect Location '${rawLocation}'`, { cause: err });
+  }
+  if (nextUrl.protocol !== 'https:' && nextUrl.protocol !== 'http:') {
+    throw new WolinAuthError(
+      `Disallowed redirect scheme '${nextUrl.protocol}' while fetching Pod resource`,
+    );
+  }
+  if (nextUrl.username !== '' || nextUrl.password !== '') {
+    throw new WolinAuthError('Userinfo credentials are forbidden in redirected Pod resource URLs');
+  }
+  if (!nextUrl.hostname) {
+    throw new WolinAuthError('Missing hostname in redirected Pod resource URL');
+  }
+  if (previousUrl.protocol === 'https:' && nextUrl.protocol !== 'https:') {
+    throw new WolinAuthError(
+      'HTTPS Pod resource request must not downgrade to cleartext HTTP via redirect',
+    );
+  }
+  return nextUrl;
+}
+
+function validateFinalResponseUrl(response: Response, sourceUrl: URL): void {
+  if (!response.url) return;
+  let finalUrl: URL;
+  try {
+    finalUrl = new URL(response.url);
+  } catch (err) {
+    throw new WolinAuthError(`Malformed final response URL '${response.url}'`, { cause: err });
+  }
+  if (finalUrl.protocol !== 'https:' && finalUrl.protocol !== 'http:') {
+    throw new WolinAuthError(`Disallowed final response scheme '${finalUrl.protocol}'`);
+  }
+  if (finalUrl.username !== '' || finalUrl.password !== '') {
+    throw new WolinAuthError('Userinfo credentials are forbidden in final response URL');
+  }
+  if (sourceUrl.protocol === 'https:' && finalUrl.protocol !== 'https:') {
+    throw new WolinAuthError(
+      'HTTPS Pod resource request must not downgrade to cleartext HTTP via redirect',
+    );
+  }
+}
+
+interface InternalFetchResult {
+  response: Response;
+  redirectedUrl?: string;
+  initialLinkHeader: string | null;
+  initialEtag: string | null;
+}
+
+/**
+ * Wolin (月印千江) W3C Solid 0.11 LDP Pod client with native RFC 9449 ES256 DPoP signing,
+ * ETag concurrency control, and credential-safe `302` signed asset redirect handling.
  */
 export class WolinPodClient {
   public readonly podUrl?: string;
@@ -366,59 +470,85 @@ export class WolinPodClient {
     return resolved.toString();
   }
 
-  /**
-   * Perform an HTTP request against a Solid Pod, signing a fresh RFC 9449 DPoP proof
-   * (`htm`, `htu`, `iat`, `jti`, `ath`) when configured with `accessToken` + `dpopKeyPair`.
-   */
-  public async fetchWithDPoP(input: string | URL, init: RequestInit = {}): Promise<Response> {
+  private async attachAuthHeaders(
+    headers: Headers,
+    method: string,
+    targetUrl: string,
+    nonce?: string,
+  ): Promise<void> {
+    if (this.accessToken) {
+      if (this.tokenType === 'DPoP') {
+        if (!this.dpopKeyPair) {
+          throw new WolinAuthError(
+            "Token type 'DPoP' requires 'dpopKeyPair' to be configured on WolinPodClient",
+          );
+        }
+        const proof = await signDPoPProof({
+          keyPair: this.dpopKeyPair,
+          htm: method,
+          htu: targetUrl,
+          accessToken: this.accessToken,
+          nonce,
+        });
+        headers.set('Authorization', `DPoP ${this.accessToken}`);
+        headers.set('DPoP', proof);
+      } else {
+        headers.set('Authorization', `Bearer ${this.accessToken}`);
+      }
+    } else if (this.dpopKeyPair) {
+      const proof = await signDPoPProof({
+        keyPair: this.dpopKeyPair,
+        htm: method,
+        htu: targetUrl,
+        nonce,
+      });
+      headers.set('DPoP', proof);
+    }
+  }
+
+  private async fetchInternal(
+    input: string | URL,
+    init: RequestInit = {},
+  ): Promise<InternalFetchResult> {
     const resolvedUrl = this.resolveUrl(input);
+    const initialParsed = new URL(resolvedUrl);
     const method = (init.method ?? 'GET').toUpperCase();
 
     if (this.accessToken && this.podBaseUrl && !this.allowCrossOriginAuth) {
-      const targetOrigin = new URL(resolvedUrl).origin;
-      if (targetOrigin !== this.podBaseUrl.origin) {
+      if (initialParsed.origin !== this.podBaseUrl.origin) {
         throw new WolinAuthError(
-          `Blocked cross-origin credential transmission from Pod origin '${this.podBaseUrl.origin}' to '${targetOrigin}'`,
+          `Blocked cross-origin credential transmission from Pod origin '${this.podBaseUrl.origin}' to '${initialParsed.origin}'`,
         );
       }
     }
 
-    const executeAttempt = async (nonce?: string): Promise<Response> => {
+    const requestedRedirect: RequestRedirect = init.redirect ?? 'follow';
+    const canSafelyFollowRedirects =
+      requestedRedirect === 'follow' && (method === 'GET' || method === 'HEAD');
+    const callerHeaders = new Headers(init.headers);
+    const hasSensitiveAuth = Boolean(
+      this.accessToken ||
+        this.dpopKeyPair ||
+        callerHeaders.has('authorization') ||
+        callerHeaders.has('dpop') ||
+        callerHeaders.has('cookie') ||
+        callerHeaders.has('proxy-authorization'),
+    );
+
+    const firstHopRedirectMode: RequestRedirect =
+      canSafelyFollowRedirects && hasSensitiveAuth ? 'manual' : requestedRedirect;
+
+    const executeAttempt = async (
+      nonce?: string,
+      overrideRedirect?: RequestRedirect,
+    ): Promise<Response> => {
       const headers = new Headers(init.headers);
-
-      if (this.accessToken) {
-        if (this.tokenType === 'DPoP') {
-          if (!this.dpopKeyPair) {
-            throw new WolinAuthError(
-              "Token type 'DPoP' requires 'dpopKeyPair' to be configured on WolinPodClient",
-            );
-          }
-          const proof = await signDPoPProof({
-            keyPair: this.dpopKeyPair,
-            htm: method,
-            htu: resolvedUrl,
-            accessToken: this.accessToken,
-            nonce,
-          });
-          headers.set('Authorization', `DPoP ${this.accessToken}`);
-          headers.set('DPoP', proof);
-        } else {
-          headers.set('Authorization', `Bearer ${this.accessToken}`);
-        }
-      } else if (this.dpopKeyPair) {
-        const proof = await signDPoPProof({
-          keyPair: this.dpopKeyPair,
-          htm: method,
-          htu: resolvedUrl,
-          nonce,
-        });
-        headers.set('DPoP', proof);
-      }
-
+      await this.attachAuthHeaders(headers, method, resolvedUrl, nonce);
       return this.fetchImpl(resolvedUrl, {
         ...init,
         method,
         headers,
+        redirect: overrideRedirect ?? firstHopRedirectMode,
       });
     };
 
@@ -443,11 +573,137 @@ export class WolinPodClient {
       }
     }
 
+    if (!canSafelyFollowRedirects) {
+      return {
+        response,
+        initialLinkHeader: null,
+        initialEtag: null,
+      };
+    }
+
+    // Browser WHATWG Fetch filters manual 3xx responses to `opaqueredirect` (status 0, hidden Location).
+    // Retry once with `redirect: 'follow'` and enforce HTTPS non-downgrade on `response.url`.
+    if (response.type === 'opaqueredirect') {
+      response = await executeAttempt(this.dpopNonce, 'follow');
+      const followNonce = response.headers.get('DPoP-Nonce');
+      if (followNonce) {
+        this.dpopNonce = followNonce;
+      }
+      validateFinalResponseUrl(response, initialParsed);
+      return {
+        response,
+        redirectedUrl:
+          response.url && response.url !== resolvedUrl ? response.url : undefined,
+        initialLinkHeader: null,
+        initialEtag: null,
+      };
+    }
+
+    const initialLinkHeader = isRedirectStatus(response.status)
+      ? response.headers.get('Link')
+      : null;
+    const initialEtag = isRedirectStatus(response.status)
+      ? response.headers.get('ETag')
+      : null;
+
+    let currentUrl = initialParsed;
+    let currentMethod = method;
+    let hops = 0;
+
+    while (isRedirectStatus(response.status)) {
+      const location = response.headers.get('Location');
+      if (!location) {
+        break;
+      }
+      if (hops >= MAX_REDIRECT_HOPS) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new WolinHttpError({
+          status: response.status,
+          statusText: 'Too Many Redirects',
+          url: currentUrl.toString(),
+          method: currentMethod,
+          message: `Exceeded maximum redirect hops (${MAX_REDIRECT_HOPS}) while fetching '${resolvedUrl}'`,
+        });
+      }
+
+      await response.body?.cancel().catch(() => undefined);
+      const nextUrl = validateRedirectTargetUrl(location, currentUrl);
+      if (response.status === 303 && currentMethod !== 'HEAD') {
+        currentMethod = 'GET';
+      }
+
+      const isWithinPodScope =
+        this.podBaseUrl !== undefined
+          ? nextUrl.origin === this.podBaseUrl.origin &&
+            nextUrl.pathname.startsWith(this.podBaseUrl.pathname)
+          : nextUrl.origin === initialParsed.origin;
+
+      const stripCredentials = !isWithinPodScope || isPresignedAssetUrl(nextUrl);
+
+      const hopHeaders = new Headers(init.headers);
+      stripSensitiveRedirectHeaders(hopHeaders);
+      if (!stripCredentials) {
+        await this.attachAuthHeaders(hopHeaders, currentMethod, nextUrl.toString(), this.dpopNonce);
+      }
+
+      const hopInit: RequestInit = {
+        ...init,
+        method: currentMethod,
+        headers: hopHeaders,
+        body: undefined,
+        redirect: 'manual',
+      };
+
+      response = await this.fetchImpl(nextUrl.toString(), hopInit);
+      if (!stripCredentials) {
+        const hopNonce = response.headers.get('DPoP-Nonce');
+        if (hopNonce) {
+          this.dpopNonce = hopNonce;
+        }
+      }
+
+      // If a stripped presigned/CDN hop itself redirects inside a browser (`opaqueredirect`),
+      // `hopHeaders` already has zero credentials, so native `redirect: 'follow'` is completely safe.
+      if (response.type === 'opaqueredirect' && stripCredentials) {
+        response = await this.fetchImpl(nextUrl.toString(), {
+          ...hopInit,
+          redirect: 'follow',
+        });
+      }
+
+      currentUrl = nextUrl;
+      hops += 1;
+    }
+
+    validateFinalResponseUrl(response, currentUrl);
+    const redirectedUrl =
+      hops > 0
+        ? currentUrl.toString()
+        : response.url && response.url !== resolvedUrl
+          ? response.url
+          : undefined;
+
+    return {
+      response,
+      redirectedUrl,
+      initialLinkHeader,
+      initialEtag,
+    };
+  }
+
+  /**
+   * Perform an HTTP request against a Solid Pod, signing a fresh RFC 9449 DPoP proof
+   * (`htm`, `htu`, `iat`, `jti`, `ath`) when configured with `accessToken` + `dpopKeyPair`,
+   * and stripping `Authorization` / `DPoP` headers across `302` signed asset redirects.
+   */
+  public async fetchWithDPoP(input: string | URL, init: RequestInit = {}): Promise<Response> {
+    const { response } = await this.fetchInternal(input, init);
     return response;
   }
 
   /**
-   * Read an RDF or binary Non-RDF resource from the Pod (`GET`) with ETag (`If-None-Match` / `If-Match`) support.
+   * Read an RDF or binary Non-RDF resource from the Pod (`GET`) with ETag (`If-None-Match` / `If-Match`)
+   * and credential-safe `302` signed R2/CDN asset redirect support.
    */
   public async getResource(
     url: string | URL,
@@ -465,21 +721,30 @@ export class WolinPodClient {
       headers.set('If-Match', options.ifMatch);
     }
 
-    const response = await this.fetchWithDPoP(resolvedUrl, {
-      method: 'GET',
-      headers,
-      signal: options.signal,
-    });
+    const { response, redirectedUrl, initialLinkHeader, initialEtag } = await this.fetchInternal(
+      resolvedUrl,
+      {
+        method: 'GET',
+        headers,
+        signal: options.signal,
+      },
+    );
+
+    const effectiveEtag = response.headers.get('ETag') ?? initialEtag;
+    const responseLinkTypes = parseLinkHeaderTypes(response.headers.get('Link'));
+    const effectiveLinkTypes =
+      responseLinkTypes.length > 0 ? responseLinkTypes : parseLinkHeaderTypes(initialLinkHeader);
 
     if (response.status === 304) {
       const empty = new Uint8Array(0);
       return {
         url: resolvedUrl,
+        ...(redirectedUrl ? { redirectedUrl } : {}),
         status: 304,
         notModified: true,
-        etag: response.headers.get('ETag'),
+        etag: effectiveEtag,
         contentType: normalizeMediaType(response.headers.get('Content-Type')),
-        linkTypes: parseLinkHeaderTypes(response.headers.get('Link')),
+        linkTypes: effectiveLinkTypes,
         headers: response.headers,
         bytes: empty,
         text: () => '',
@@ -501,16 +766,41 @@ export class WolinPodClient {
 
     return {
       url: resolvedUrl,
+      ...(redirectedUrl ? { redirectedUrl } : {}),
       status: response.status,
       notModified: false,
-      etag: response.headers.get('ETag'),
+      etag: effectiveEtag,
       contentType: normalizeMediaType(response.headers.get('Content-Type')),
-      linkTypes: parseLinkHeaderTypes(response.headers.get('Link')),
+      linkTypes: effectiveLinkTypes,
       headers: response.headers,
       bytes,
       text: () => textDecoder.decode(bytes),
       json: <T = unknown>(): T => JSON.parse(textDecoder.decode(bytes)) as T,
     };
+  }
+
+  /**
+   * Convenience alias for {@link getResource} (`GET` RDF or binary/blob resource with safe `302` redirect handling).
+   */
+  public async get(url: string | URL, options: GetResourceOptions = {}): Promise<PodResource> {
+    return this.getResource(url, options);
+  }
+
+  /**
+   * Read a binary/blob `NonRDFSource` resource (such as `.glb`, `.vrm`, image, or media) as a standard `Blob`,
+   * following `302` signed R2/CDN redirects without leaking `Authorization` or `DPoP` headers.
+   */
+  public async getBlob(url: string | URL, options: GetResourceOptions = {}): Promise<Blob> {
+    const res = await this.getResource(url, options);
+    if (res.notModified) {
+      throw new WolinError(
+        'INVALID_ARGUMENT',
+        'Cannot construct Blob payload from a 304 Not Modified response',
+      );
+    }
+    return new Blob([res.bytes as BlobPart], {
+      type: res.contentType ?? 'application/octet-stream',
+    });
   }
 
   /**

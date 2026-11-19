@@ -23,6 +23,11 @@ export const LDP_CONTAINER_IRI = 'http://www.w3.org/ns/ldp#Container';
 export const LDP_BASIC_CONTAINER_IRI = 'http://www.w3.org/ns/ldp#BasicContainer';
 export const FOAF_NAME_IRI = 'http://xmlns.com/foaf/0.1/name';
 export const VCARD_FN_IRI = 'http://www.w3.org/2006/vcard/ns#fn';
+export const WOLIN_NS_IRI = 'https://wolin.id/ns#';
+export const WOLIN_DISPLAY_NAME_IRI = 'https://wolin.id/ns#displayName';
+export const WOLIN_AVATAR_GLB_URL_IRI = 'https://wolin.id/ns#avatarGlbUrl';
+export const WOLIN_AVATAR_VRM_URL_IRI = 'https://wolin.id/ns#avatarVrmUrl';
+export const WOLIN_AVATAR_VARIANTS_IRI = 'https://wolin.id/ns#avatarVariants';
 
 const SUPPORTED_TURTLE_MEDIA_TYPES = new Set([
   '',
@@ -48,6 +53,10 @@ export interface WebIdProfile {
   storages: string[];
   inboxes: string[];
   name?: string;
+  displayName?: string;
+  avatarGlbUrl?: string;
+  avatarVrmUrl?: string;
+  avatarVariants?: string;
   primaryStorage?: string;
   primaryOidcIssuer?: string;
   primaryInbox?: string;
@@ -758,6 +767,10 @@ export function parseWebIdProfile(
   const seenInboxes = new Set<string>();
   let foafName: string | undefined;
   let vcardFn: string | undefined;
+  let displayName: string | undefined;
+  let avatarGlbUrl: string | undefined;
+  let avatarVrmUrl: string | undefined;
+  let avatarVariants: string | undefined;
 
   for (const triple of triples) {
     const canonicalSubject = triple.subject.startsWith('_:')
@@ -784,12 +797,26 @@ export function parseWebIdProfile(
       } else if (triple.predicate === LDP_INBOX_IRI && !seenInboxes.has(triple.object)) {
         seenInboxes.add(triple.object);
         inboxes.push(triple.object);
+      } else if (triple.predicate === WOLIN_AVATAR_GLB_URL_IRI && avatarGlbUrl === undefined) {
+        avatarGlbUrl = triple.object;
+      } else if (triple.predicate === WOLIN_AVATAR_VRM_URL_IRI && avatarVrmUrl === undefined) {
+        avatarVrmUrl = triple.object;
+      } else if (triple.predicate === WOLIN_AVATAR_VARIANTS_IRI && avatarVariants === undefined) {
+        avatarVariants = triple.object;
       }
     } else if (triple.objectType === 'literal') {
       if (triple.predicate === FOAF_NAME_IRI && foafName === undefined) {
         foafName = triple.object;
       } else if (triple.predicate === VCARD_FN_IRI && vcardFn === undefined) {
         vcardFn = triple.object;
+      } else if (triple.predicate === WOLIN_DISPLAY_NAME_IRI && displayName === undefined) {
+        displayName = triple.object;
+      } else if (triple.predicate === WOLIN_AVATAR_GLB_URL_IRI && avatarGlbUrl === undefined) {
+        avatarGlbUrl = triple.object;
+      } else if (triple.predicate === WOLIN_AVATAR_VRM_URL_IRI && avatarVrmUrl === undefined) {
+        avatarVrmUrl = triple.object;
+      } else if (triple.predicate === WOLIN_AVATAR_VARIANTS_IRI && avatarVariants === undefined) {
+        avatarVariants = triple.object;
       }
     }
   }
@@ -799,7 +826,11 @@ export function parseWebIdProfile(
     oidcIssuers,
     storages,
     inboxes,
-    name: foafName ?? vcardFn,
+    name: foafName ?? vcardFn ?? displayName,
+    displayName,
+    avatarGlbUrl,
+    avatarVrmUrl,
+    avatarVariants,
     primaryStorage: storages[0],
     primaryOidcIssuer: oidcIssuers[0],
     primaryInbox: inboxes[0],

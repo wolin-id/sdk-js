@@ -35,6 +35,7 @@ export interface BuildSolidAuthUrlOptions {
   codeChallenge: string;
   state?: string;
   nonce?: string;
+  dpopJkt?: string;
   scopes?: readonly string[];
   prompt?: string;
   extraParams?: Record<string, string>;
@@ -48,6 +49,8 @@ export interface CreateSolidAuthRequestOptions
 export interface SolidAuthRequest {
   url: string;
   state: string;
+  nonce?: string;
+  dpopJkt?: string;
   codeVerifier: string;
   codeChallenge: string;
   clientId: string;
@@ -62,6 +65,7 @@ export interface TokenExchangeOptions {
   clientId: string;
   clientSecret?: string;
   expectedIssuer?: string;
+  expectedNonce?: string;
   nowEpochSecs?: number;
   clockSkewSecs?: number;
   dpopKeyPair: DPoPKeyPair;
@@ -257,6 +261,12 @@ export function buildSolidAuthUrl(options: BuildSolidAuthUrlOptions): string {
   if (options.state !== undefined && !options.state.trim()) {
     throw new WolinAuthError('OAuth state parameter must not be empty when provided');
   }
+  if (options.nonce !== undefined && !options.nonce.trim()) {
+    throw new WolinAuthError('OIDC nonce parameter must not be empty when provided');
+  }
+  if (options.dpopJkt !== undefined && !options.dpopJkt.trim()) {
+    throw new WolinAuthError('DPoP JWK thumbprint (dpopJkt) must not be empty when provided');
+  }
 
   const scopes =
     options.scopes && options.scopes.length > 0 ? options.scopes : DEFAULT_SOLID_OIDC_SCOPES;
@@ -277,8 +287,11 @@ export function buildSolidAuthUrl(options: BuildSolidAuthUrlOptions): string {
   if (options.state !== undefined) {
     authUrl.searchParams.set('state', options.state.trim());
   }
-  if (options.nonce) {
-    authUrl.searchParams.set('nonce', options.nonce);
+  if (options.nonce !== undefined) {
+    authUrl.searchParams.set('nonce', options.nonce.trim());
+  }
+  if (options.dpopJkt !== undefined) {
+    authUrl.searchParams.set('dpop_jkt', options.dpopJkt.trim());
   }
   if (options.prompt) {
     authUrl.searchParams.set('prompt', options.prompt);
@@ -303,10 +316,15 @@ export async function createSolidAuthRequest(
     state,
     codeChallenge: pkce.codeChallenge,
   });
+  const resolvedNonce = options.nonce?.trim() || options.extraParams?.nonce?.trim() || undefined;
+  const resolvedDpopJkt =
+    options.dpopJkt?.trim() || options.extraParams?.dpop_jkt?.trim() || undefined;
 
   return {
     url,
     state,
+    nonce: resolvedNonce,
+    dpopJkt: resolvedDpopJkt,
     codeVerifier: pkce.codeVerifier,
     codeChallenge: pkce.codeChallenge,
     clientId: options.clientId.trim(),
@@ -338,6 +356,7 @@ export function decodeJwtPayload(jwt: string): Record<string, unknown> {
 interface TokenClaimValidationContext {
   clientId: string;
   expectedIssuer?: string;
+  expectedNonce?: string;
   expectedJkt?: string;
   tokenType: 'DPoP' | 'Bearer';
   nowEpochSecs: number;
@@ -396,6 +415,15 @@ function validateJwtClaimsObject(
     }
     if (claims.iat > ctx.nowEpochSecs + ctx.clockSkewSecs) {
       throw new WolinAuthError('Solid-OIDC token iat is in the future');
+    }
+  }
+
+  if (isIdToken && ctx.expectedNonce !== undefined) {
+    if (!ctx.expectedNonce.trim()) {
+      throw new WolinAuthError('Expected OIDC nonce must not be empty when provided');
+    }
+    if (typeof claims.nonce !== 'string' || claims.nonce !== ctx.expectedNonce) {
+      throw new WolinAuthError("Solid-OIDC id_token 'nonce' claim does not match expected nonce");
     }
   }
 
@@ -603,6 +631,7 @@ export async function exchangeCodeForTokens(
     {
       clientId: options.clientId.trim(),
       expectedIssuer: options.expectedIssuer,
+      expectedNonce: options.expectedNonce,
       nowEpochSecs: options.nowEpochSecs ?? Math.floor(Date.now() / 1000),
       clockSkewSecs: Math.max(0, options.clockSkewSecs ?? DEFAULT_CLOCK_SKEW_SECS),
     },

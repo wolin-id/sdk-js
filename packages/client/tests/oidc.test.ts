@@ -32,12 +32,15 @@ describe('@wolin-id/client — Solid-OIDC Discovery, PKCE & Token Exchange', () 
     expect(pkce.codeChallenge).toBe(expectedChallenge);
   });
 
-  it('builds a Solid-OIDC PKCE authorization URL with openid & webid scopes', async () => {
+  it('builds a Solid-OIDC PKCE authorization URL with openid & webid scopes, nonce, and dpop_jkt', async () => {
+    const kp = await generateDPoPKeyPair();
     const authReq = await createSolidAuthRequest({
       authorizationEndpoint: 'https://auth.wolin.id/oauth/v2/authorize',
       clientId: 'https://app.wolin.id/client.jsonld',
       redirectUri: 'https://app.wolin.id/auth/callback',
       state: 'state-xyz-123',
+      nonce: 'nonce-abc-456',
+      dpopJkt: kp.jkt,
       prompt: 'consent',
     });
 
@@ -49,8 +52,12 @@ describe('@wolin-id/client — Solid-OIDC Discovery, PKCE & Token Exchange', () 
     expect(parsed.searchParams.get('code_challenge')).toBe(authReq.codeChallenge);
     expect(parsed.searchParams.get('code_challenge_method')).toBe('S256');
     expect(parsed.searchParams.get('state')).toBe('state-xyz-123');
+    expect(parsed.searchParams.get('nonce')).toBe('nonce-abc-456');
+    expect(parsed.searchParams.get('dpop_jkt')).toBe(kp.jkt);
     expect(parsed.searchParams.get('scope')).toBe('openid webid offline_access');
     expect(parsed.searchParams.get('prompt')).toBe('consent');
+    expect(authReq.nonce).toBe('nonce-abc-456');
+    expect(authReq.dpopJkt).toBe(kp.jkt);
 
     // Direct buildSolidAuthUrl rejects invalid scheme
     expect(() =>

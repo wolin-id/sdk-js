@@ -109,4 +109,9 @@ export {
   VCARD_FN_IRI,
   verifyWebIdOidcIssuer,
   type WebIdProfile,
+  WOLIN_AVATAR_GLB_URL_IRI,
+  WOLIN_AVATAR_VARIANTS_IRI,
+  WOLIN_AVATAR_VRM_URL_IRI,
+  WOLIN_DISPLAY_NAME_IRI,
+  WOLIN_NS_IRI,
 } from './webid.js';

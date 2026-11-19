@@ -1,12 +1,15 @@
 import {
+  computeJwkThumbprint,
   createSolidAuthRequest,
   DEFAULT_WOLIN_OIDC_ISSUER,
   type DPoPKeyPair,
+  type DPoPPublicJwk,
   decodeJwtPayload,
   discoverOidcProvider,
   exchangeCodeForTokens,
   fetchWebIdProfile,
   generateDPoPKeyPair,
+  generateRandomState,
   normalizeAuthTokenType,
   type OidcProviderMetadata,
   type SolidAuthRequest,
@@ -27,11 +30,19 @@ import {
   useState,
 } from 'react';
 
+export const WOLIN_PENDING_AUTH_STORAGE_KEY = 'wolin:solid-oidc:pending';
+const WOLIN_DPOP_FALLBACK_STORAGE_PREFIX = 'wolin:solid-oidc:dpop-jwk:';
+export const WOLIN_DPOP_IDB_NAME = 'wolin-solid-auth';
+const WOLIN_DPOP_IDB_VERSION = 1;
+export const WOLIN_DPOP_IDB_STORE = 'dpop-keys';
+const WOLIN_DPOP_ACTIVE_IDB_KEY = 'active-dpop-keypair';
+
 export interface WolinSessionState {
   webId: string;
   accessToken: string;
   tokenType: 'DPoP' | 'Bearer';
   dpopKeyPair?: DPoPKeyPair;
+  dpopJkt?: string;
   idToken?: string;
   refreshToken?: string;
   expiresAt?: number;
@@ -49,6 +60,7 @@ export interface LoginOptions {
   redirectUri?: string;
   scopes?: readonly string[];
   state?: string;
+  nonce?: string;
   prompt?: string;
   /** Whether to navigate `window.location` automatically in browser environments (default: `true`). */
   redirect?: boolean;
@@ -67,7 +79,20 @@ export interface PendingSolidAuth {
   oidcIssuer: string;
   clientId?: string;
   redirectUri?: string;
+  nonce?: string;
   dpopKeyPair: DPoPKeyPair;
+}
+
+export interface StoredPendingSolidAuth {
+  state: string;
+  codeVerifier: string;
+  nonce: string;
+  redirectUri: string;
+  issuer: string;
+  clientId: string;
+  tokenEndpoint?: string;
+  dpopJkt: string;
+  createdAt?: number;
 }
 
 export interface WolinContextValue {
@@ -101,6 +126,385 @@ export interface WolinProviderProps {
 
 export const WolinContext = createContext<WolinContextValue | null>(null);
 
+const memoryFallbackStorage = new Map<string, string>();
+
+function getSafeSessionStorage(): Storage | null {
+  try {
+    if (typeof globalThis !== 'undefined' && 'sessionStorage' in globalThis && globalThis.sessionStorage) {
+      return globalThis.sessionStorage;
+    }
+  } catch {
+    // Blocked in sandboxed iframe or SSR
+  }
+  return null;
+}
+
+function writeStorageItem(key: string, value: string): void {
+  const store = getSafeSessionStorage();
+  if (store) {
+    store.setItem(key, value);
+  } else {
+    memoryFallbackStorage.set(key, value);
+  }
+}
+
+function readStorageItem(key: string): string | null {
+  const store = getSafeSessionStorage();
+  if (store) {
+    return store.getItem(key);
+  }
+  return memoryFallbackStorage.get(key) ?? null;
+}
+
+function removeStorageItem(key: string): void {
+  const store = getSafeSessionStorage();
+  if (store) {
+    store.removeItem(key);
+  }
+  memoryFallbackStorage.delete(key);
+}
+
+function clearFallbackDpopStorage(): void {
+  const store = getSafeSessionStorage();
+  if (store) {
+    const keysToRemove: string[] = [];
+    for (let i = 0; i < store.length; i++) {
+      const k = store.key(i);
+      if (k && k.startsWith(WOLIN_DPOP_FALLBACK_STORAGE_PREFIX)) {
+        keysToRemove.push(k);
+      }
+    }
+    for (const k of keysToRemove) {
+      store.removeItem(k);
+    }
+  }
+  for (const k of Array.from(memoryFallbackStorage.keys())) {
+    if (k.startsWith(WOLIN_DPOP_FALLBACK_STORAGE_PREFIX)) {
+      memoryFallbackStorage.delete(k);
+    }
+  }
+}
+
+function openDpopIndexedDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof globalThis === 'undefined' || !globalThis.indexedDB) {
+      reject(new Error('IndexedDB is not available in this environment'));
+      return;
+    }
+    let req: IDBOpenDBRequest;
+    try {
+      req = globalThis.indexedDB.open(WOLIN_DPOP_IDB_NAME, WOLIN_DPOP_IDB_VERSION);
+    } catch (err) {
+      reject(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(WOLIN_DPOP_IDB_STORE)) {
+        db.createObjectStore(WOLIN_DPOP_IDB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error ?? new Error('Failed to open Wolin DPoP IndexedDB'));
+  });
+}
+
+function isValidDpopKeyPairRecord(candidate: unknown, expectedJkt?: string): candidate is DPoPKeyPair {
+  if (!candidate || typeof candidate !== 'object') return false;
+  const rec = candidate as Partial<DPoPKeyPair>;
+  if (!rec.privateKey || !rec.publicKey || !rec.publicJwk || typeof rec.jkt !== 'string') {
+    return false;
+  }
+  if (expectedJkt && rec.jkt !== expectedJkt) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Persist a Web Crypto ES256 `DPoPKeyPair` (with non-extractable `privateKey`) in IndexedDB.
+ */
+export async function saveDpopKeyPairToIndexedDb(
+  keyPair: DPoPKeyPair,
+  markActive = false,
+): Promise<void> {
+  const db = await openDpopIndexedDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(WOLIN_DPOP_IDB_STORE, 'readwrite');
+    const store = tx.objectStore(WOLIN_DPOP_IDB_STORE);
+    store.put(keyPair, `jkt:${keyPair.jkt}`);
+    if (markActive) {
+      store.put(keyPair, WOLIN_DPOP_ACTIVE_IDB_KEY);
+    }
+    tx.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error ?? new Error('Failed to persist DPoP keypair in IndexedDB'));
+    };
+    tx.onabort = () => {
+      db.close();
+      reject(tx.error ?? new Error('IndexedDB transaction aborted while saving DPoP keypair'));
+    };
+  });
+}
+
+/**
+ * Restore a `DPoPKeyPair` from IndexedDB by RFC 7638 `jkt` thumbprint (or active keypair).
+ */
+export async function loadDpopKeyPairFromIndexedDb(jkt?: string): Promise<DPoPKeyPair | null> {
+  let db: IDBDatabase;
+  try {
+    db = await openDpopIndexedDb();
+  } catch {
+    return null;
+  }
+  const lookupKey = jkt ? `jkt:${jkt}` : WOLIN_DPOP_ACTIVE_IDB_KEY;
+  return new Promise<DPoPKeyPair | null>((resolve) => {
+    try {
+      const tx = db.transaction(WOLIN_DPOP_IDB_STORE, 'readonly');
+      const req = tx.objectStore(WOLIN_DPOP_IDB_STORE).get(lookupKey);
+      req.onsuccess = () => {
+        db.close();
+        const val = req.result as unknown;
+        resolve(isValidDpopKeyPairRecord(val, jkt) ? val : null);
+      };
+      req.onerror = () => {
+        db.close();
+        resolve(null);
+      };
+    } catch {
+      db.close();
+      resolve(null);
+    }
+  });
+}
+
+/**
+ * Clear persisted DPoP keypairs from IndexedDB (called on logout / session reset).
+ */
+export async function clearDpopKeyPairsFromIndexedDb(): Promise<void> {
+  let db: IDBDatabase;
+  try {
+    db = await openDpopIndexedDb();
+  } catch {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(WOLIN_DPOP_IDB_STORE, 'readwrite');
+      tx.objectStore(WOLIN_DPOP_IDB_STORE).clear();
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => {
+        db.close();
+        resolve();
+      };
+    } catch {
+      db.close();
+      resolve();
+    }
+  });
+}
+
+async function deleteDpopKeyPairByJkt(jkt: string): Promise<void> {
+  removeStorageItem(`${WOLIN_DPOP_FALLBACK_STORAGE_PREFIX}${jkt}`);
+  let db: IDBDatabase;
+  try {
+    db = await openDpopIndexedDb();
+  } catch {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(WOLIN_DPOP_IDB_STORE, 'readwrite');
+      tx.objectStore(WOLIN_DPOP_IDB_STORE).delete(`jkt:${jkt}`);
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => {
+        db.close();
+        resolve();
+      };
+    } catch {
+      db.close();
+      resolve();
+    }
+  });
+}
+
+async function createAndPersistPendingDpopKeyPair(): Promise<DPoPKeyPair> {
+  if (typeof globalThis !== 'undefined' && globalThis.indexedDB) {
+    try {
+      const nonExtractableKeyPair = await generateDPoPKeyPair({ extractable: false });
+      await saveDpopKeyPairToIndexedDb(nonExtractableKeyPair, false);
+      return nonExtractableKeyPair;
+    } catch {
+      // Fall through to JWK restoration fallback when IndexedDB is blocked (e.g. strict sandbox)
+    }
+  }
+
+  // Fallback for non-IDB environments (e.g. jsdom / restricted WebViews):
+  // Export JWK once for redirect persistence, then re-import privateKey as non-extractable.
+  const tempExtractable = await generateDPoPKeyPair({ extractable: true });
+  const exportedPrivateJwk = await globalThis.crypto.subtle.exportKey(
+    'jwk',
+    tempExtractable.privateKey,
+  );
+  writeStorageItem(
+    `${WOLIN_DPOP_FALLBACK_STORAGE_PREFIX}${tempExtractable.jkt}`,
+    JSON.stringify({
+      privateJwk: exportedPrivateJwk,
+      publicJwk: tempExtractable.publicJwk,
+      jkt: tempExtractable.jkt,
+    }),
+  );
+
+  const nonExtractablePrivate = await globalThis.crypto.subtle.importKey(
+    'jwk',
+    exportedPrivateJwk,
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    false,
+    ['sign'],
+  );
+
+  return {
+    privateKey: nonExtractablePrivate,
+    publicKey: tempExtractable.publicKey,
+    publicJwk: tempExtractable.publicJwk,
+    jkt: tempExtractable.jkt,
+  };
+}
+
+async function restorePendingDpopKeyPair(expectedJkt: string): Promise<DPoPKeyPair> {
+  const fromIdb = await loadDpopKeyPairFromIndexedDb(expectedJkt);
+  if (fromIdb) {
+    try {
+      await saveDpopKeyPairToIndexedDb(fromIdb, true);
+    } catch {
+      // Ignore secondary active-slot write failure
+    }
+    return fromIdb;
+  }
+
+  const fallbackKey = `${WOLIN_DPOP_FALLBACK_STORAGE_PREFIX}${expectedJkt}`;
+  const rawFallback = readStorageItem(fallbackKey);
+  if (rawFallback) {
+    removeStorageItem(fallbackKey);
+    let parsed: { privateJwk?: JsonWebKey; publicJwk?: DPoPPublicJwk; jkt?: string };
+    try {
+      parsed = JSON.parse(rawFallback) as {
+        privateJwk?: JsonWebKey;
+        publicJwk?: DPoPPublicJwk;
+        jkt?: string;
+      };
+    } catch (err) {
+      throw new WolinAuthError('Corrupted DPoP fallback key material in storage', { cause: err });
+    }
+    if (!parsed.privateJwk || !parsed.publicJwk) {
+      throw new WolinAuthError('Incomplete DPoP fallback key material in storage');
+    }
+    const computedJkt = await computeJwkThumbprint(parsed.publicJwk);
+    if (computedJkt !== expectedJkt) {
+      throw new WolinAuthError('Restored DPoP keypair thumbprint does not match expected dpop_jkt');
+    }
+    const [privateKey, publicKey] = await Promise.all([
+      globalThis.crypto.subtle.importKey(
+        'jwk',
+        parsed.privateJwk,
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        false,
+        ['sign'],
+      ),
+      globalThis.crypto.subtle.importKey(
+        'jwk',
+        parsed.publicJwk,
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        false,
+        ['verify'],
+      ),
+    ]);
+    return {
+      privateKey,
+      publicKey,
+      publicJwk: parsed.publicJwk,
+      jkt: computedJkt,
+    };
+  }
+
+  throw new WolinAuthError(
+    `Failed to restore DPoP keypair matching pending Solid-OIDC authorization (dpop_jkt '${expectedJkt}')`,
+  );
+}
+
+function savePendingAuthState(pending: StoredPendingSolidAuth): void {
+  writeStorageItem(WOLIN_PENDING_AUTH_STORAGE_KEY, JSON.stringify(pending));
+}
+
+function consumePendingAuthState(): StoredPendingSolidAuth | null {
+  const raw = readStorageItem(WOLIN_PENDING_AUTH_STORAGE_KEY);
+  if (!raw) return null;
+  removeStorageItem(WOLIN_PENDING_AUTH_STORAGE_KEY);
+
+  let parsed: Record<string, unknown>;
+  try {
+    const json = JSON.parse(raw) as unknown;
+    if (!json || typeof json !== 'object' || Array.isArray(json)) {
+      throw new WolinAuthError('Stored pending Solid-OIDC state must be a JSON object');
+    }
+    parsed = json as Record<string, unknown>;
+  } catch (err) {
+    if (err instanceof WolinAuthError) throw err;
+    throw new WolinAuthError('Malformed JSON in stored pending Solid-OIDC state', { cause: err });
+  }
+
+  const state =
+    typeof parsed.state === 'string'
+      ? parsed.state
+      : typeof parsed.expectedState === 'string'
+        ? parsed.expectedState
+        : '';
+  const issuer =
+    typeof parsed.issuer === 'string'
+      ? parsed.issuer
+      : typeof parsed.oidcIssuer === 'string'
+        ? parsed.oidcIssuer
+        : '';
+  const codeVerifier = typeof parsed.codeVerifier === 'string' ? parsed.codeVerifier : '';
+  const nonce = typeof parsed.nonce === 'string' ? parsed.nonce : '';
+  const redirectUri = typeof parsed.redirectUri === 'string' ? parsed.redirectUri : '';
+  const clientId = typeof parsed.clientId === 'string' ? parsed.clientId : '';
+  const tokenEndpoint =
+    typeof parsed.tokenEndpoint === 'string' && parsed.tokenEndpoint.trim()
+      ? parsed.tokenEndpoint.trim()
+      : undefined;
+  const dpopJkt = typeof parsed.dpopJkt === 'string' ? parsed.dpopJkt : '';
+  const createdAt = typeof parsed.createdAt === 'number' ? parsed.createdAt : undefined;
+
+  return {
+    state,
+    codeVerifier,
+    nonce,
+    redirectUri,
+    issuer,
+    clientId,
+    tokenEndpoint,
+    dpopJkt,
+    createdAt,
+  };
+}
+
+function clearAllPersistedAuthArtifacts(): void {
+  removeStorageItem(WOLIN_PENDING_AUTH_STORAGE_KEY);
+  clearFallbackDpopStorage();
+  void clearDpopKeyPairsFromIndexedDb();
+}
+
 function extractIssuerFromTokens(idToken?: string, accessToken?: string): string | undefined {
   for (const tok of [idToken, accessToken]) {
     if (!tok || tok.split('.').length !== 3) continue;
@@ -112,6 +516,22 @@ function extractIssuerFromTokens(idToken?: string, accessToken?: string): string
     } catch {
       // Ignore opaque access token
     }
+  }
+  return undefined;
+}
+
+function extractJktFromAccessToken(accessToken?: string): string | undefined {
+  if (!accessToken || accessToken.split('.').length !== 3) return undefined;
+  try {
+    const claims = decodeJwtPayload(accessToken);
+    if (claims.cnf && typeof claims.cnf === 'object' && !Array.isArray(claims.cnf)) {
+      const jkt = (claims.cnf as Record<string, unknown>).jkt;
+      if (typeof jkt === 'string' && jkt.trim()) {
+        return jkt.trim();
+      }
+    }
+  } catch {
+    // Ignore non-JWT access token
   }
   return undefined;
 }
@@ -131,7 +551,6 @@ export function WolinProvider({
   const [isAuthenticating, setIsAuthenticating] = useState<boolean>(false);
   const [error, setError] = useState<Error | null>(null);
 
-  const pendingAuthRef = useRef<PendingSolidAuth | null>(null);
   const inFlightCallbacksRef = useRef<Map<string, Promise<WolinSessionState>>>(new Map());
   const mountedRef = useRef<boolean>(true);
   const authEpochRef = useRef<number>(0);
@@ -152,10 +571,45 @@ export function WolinProvider({
     [onSessionChange],
   );
 
+  // Cleanly restore non-extractable DPoP keypair from IndexedDB if session was hydrated without CryptoKey
+  useEffect(() => {
+    if (!session || session.tokenType !== 'DPoP' || session.dpopKeyPair) {
+      return;
+    }
+    const targetJkt = session.dpopJkt ?? extractJktFromAccessToken(session.accessToken);
+    if (!targetJkt) {
+      return;
+    }
+    let cancelled = false;
+    const epochAtStart = authEpochRef.current;
+    void loadDpopKeyPairFromIndexedDb(targetJkt).then((restored) => {
+      if (
+        cancelled ||
+        !restored ||
+        !mountedRef.current ||
+        authEpochRef.current !== epochAtStart
+      ) {
+        return;
+      }
+      commitSession({
+        ...session,
+        dpopKeyPair: restored,
+        dpopJkt: restored.jkt,
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [session, commitSession]);
+
   const setSession = useCallback(
     (next: WolinSessionState | null) => {
       authEpochRef.current += 1;
-      pendingAuthRef.current = null;
+      removeStorageItem(WOLIN_PENDING_AUTH_STORAGE_KEY);
+      clearFallbackDpopStorage();
+      if (next === null) {
+        void clearDpopKeyPairsFromIndexedDb();
+      }
       inFlightCallbacksRef.current.clear();
       if (mountedRef.current) {
         setIsAuthenticating(false);
@@ -204,6 +658,9 @@ export function WolinProvider({
             'clientId and redirectUri must be provided to WolinProvider or login()',
           );
         }
+        if (options?.nonce !== undefined && !options.nonce.trim()) {
+          throw new WolinAuthError('OIDC nonce parameter must not be empty when provided');
+        }
 
         let resolvedIssuer = options?.oidcIssuer;
         if (!resolvedIssuer && options?.webId) {
@@ -223,26 +680,34 @@ export function WolinProvider({
         }
 
         const providerMetadata = await discoverOidcProvider(resolvedIssuer, { fetchFn });
-        const dpopKeyPair = await generateDPoPKeyPair();
+        const dpopKeyPair = await createAndPersistPendingDpopKeyPair();
+        const nonce =
+          options?.nonce !== undefined ? options.nonce.trim() : generateRandomState(24);
         const authRequest = await createSolidAuthRequest({
           authorizationEndpoint: providerMetadata.authorization_endpoint,
           clientId: resolvedClientId,
           redirectUri: resolvedRedirectUri,
           scopes: options?.scopes,
           state: options?.state,
+          nonce,
+          dpopJkt: dpopKeyPair.jkt,
           prompt: options?.prompt,
         });
 
         if (authEpochRef.current === loginEpoch) {
-          pendingAuthRef.current = {
+          savePendingAuthState({
+            state: authRequest.state,
             codeVerifier: authRequest.codeVerifier,
-            expectedState: authRequest.state,
-            tokenEndpoint: providerMetadata.token_endpoint,
-            oidcIssuer: providerMetadata.issuer,
-            clientId: resolvedClientId,
+            nonce,
             redirectUri: resolvedRedirectUri,
-            dpopKeyPair,
-          };
+            issuer: providerMetadata.issuer,
+            clientId: resolvedClientId,
+            tokenEndpoint: providerMetadata.token_endpoint,
+            dpopJkt: dpopKeyPair.jkt,
+            createdAt: Date.now(),
+          });
+        } else {
+          await deleteDpopKeyPairByJkt(dpopKeyPair.jkt);
         }
 
         if (
@@ -286,17 +751,36 @@ export function WolinProvider({
       }
 
       const runExchange = async (): Promise<WolinSessionState> => {
+        let storedPending: StoredPendingSolidAuth | null = null;
         try {
-          const pending = overridePending ?? pendingAuthRef.current;
-          if (!pending) {
-            throw new WolinAuthError(
-              'No pending Solid-OIDC login state found for redirect callback',
-            );
+          if (!overridePending) {
+            storedPending = consumePendingAuthState();
+            if (!storedPending) {
+              throw new WolinAuthError(
+                'No pending Solid-OIDC login state found for redirect callback',
+              );
+            }
           }
+
+          const expectedState = overridePending
+            ? overridePending.expectedState
+            : storedPending!.state;
+          const oidcIssuer = overridePending
+            ? overridePending.oidcIssuer
+            : storedPending!.issuer;
+          const codeVerifier = overridePending
+            ? overridePending.codeVerifier
+            : storedPending!.codeVerifier;
+          const expectedNonce = overridePending
+            ? overridePending.nonce
+            : storedPending!.nonce || undefined;
 
           const parsedCallback = new URL(callbackUrl, 'https://localhost');
           const oauthError = parsedCallback.searchParams.get('error');
           if (oauthError) {
+            if (storedPending?.dpopJkt) {
+              await deleteDpopKeyPairByJkt(storedPending.dpopJkt);
+            }
             const desc = parsedCallback.searchParams.get('error_description');
             throw new WolinAuthError(
               `Solid-OIDC authorization failed: ${oauthError}${desc ? ` (${desc})` : ''}`,
@@ -306,42 +790,77 @@ export function WolinProvider({
           const code = parsedCallback.searchParams.get('code');
           const returnedState = parsedCallback.searchParams.get('state');
           if (!code) {
+            if (storedPending?.dpopJkt) {
+              await deleteDpopKeyPairByJkt(storedPending.dpopJkt);
+            }
             throw new WolinAuthError("Redirect callback URL is missing authorization 'code'");
           }
-          if (!pending.expectedState || !pending.expectedState.trim()) {
+          if (!expectedState || !expectedState.trim()) {
+            if (storedPending?.dpopJkt) {
+              await deleteDpopKeyPairByJkt(storedPending.dpopJkt);
+            }
             throw new WolinAuthError(
               'Pending Solid-OIDC login state is missing required CSRF expectedState',
             );
           }
-          if (!returnedState || returnedState !== pending.expectedState) {
+          if (!returnedState || returnedState !== expectedState) {
+            if (storedPending?.dpopJkt) {
+              await deleteDpopKeyPairByJkt(storedPending.dpopJkt);
+            }
             throw new WolinAuthError('Solid-OIDC OAuth state mismatch in redirect callback');
           }
 
-          if (!pending.oidcIssuer || !pending.oidcIssuer.trim()) {
+          if (!oidcIssuer || !oidcIssuer.trim()) {
+            if (storedPending?.dpopJkt) {
+              await deleteDpopKeyPairByJkt(storedPending.dpopJkt);
+            }
             throw new WolinAuthError(
               'Pending Solid-OIDC login state is missing required oidcIssuer',
             );
           }
 
-          const resolvedClientId = pending.clientId ?? defaultClientId;
-          const resolvedRedirectUri = pending.redirectUri ?? defaultRedirectUri;
+          const resolvedClientId =
+            (overridePending ? overridePending.clientId : storedPending!.clientId) ||
+            defaultClientId;
+          const resolvedRedirectUri =
+            (overridePending ? overridePending.redirectUri : storedPending!.redirectUri) ||
+            defaultRedirectUri;
           if (!resolvedClientId || !resolvedRedirectUri) {
+            if (storedPending?.dpopJkt) {
+              await deleteDpopKeyPairByJkt(storedPending.dpopJkt);
+            }
             throw new WolinAuthError('Missing clientId or redirectUri during callback exchange');
           }
 
-          // Consume single-use authorization state synchronously before network await
-          if (!overridePending) {
-            pendingAuthRef.current = null;
+          let dpopKeyPair: DPoPKeyPair;
+          if (overridePending) {
+            dpopKeyPair = overridePending.dpopKeyPair;
+          } else {
+            if (!storedPending!.dpopJkt || !storedPending!.dpopJkt.trim()) {
+              throw new WolinAuthError(
+                'Pending Solid-OIDC login state is missing required dpopJkt binding',
+              );
+            }
+            dpopKeyPair = await restorePendingDpopKeyPair(storedPending!.dpopJkt);
+          }
+
+          let tokenEndpoint = overridePending
+            ? overridePending.tokenEndpoint
+            : storedPending!.tokenEndpoint;
+          if (!tokenEndpoint) {
+            const discovered = await discoverOidcProvider(oidcIssuer, { fetchFn });
+            tokenEndpoint = discovered.token_endpoint;
           }
 
           const tokenSet = await exchangeCodeForTokens({
-            tokenEndpoint: pending.tokenEndpoint,
+            tokenEndpoint,
             code,
-            codeVerifier: pending.codeVerifier,
+            codeVerifier,
             redirectUri: resolvedRedirectUri,
             clientId: resolvedClientId,
-            expectedIssuer: pending.oidcIssuer,
-            dpopKeyPair: pending.dpopKeyPair,
+            expectedIssuer: oidcIssuer,
+            expectedNonce,
+            dpopKeyPair,
             fetchFn,
           });
 
@@ -353,8 +872,7 @@ export function WolinProvider({
           }
 
           const effectiveIssuer =
-            extractIssuerFromTokens(tokenSet.idToken, tokenSet.accessToken) ??
-            pending.oidcIssuer.trim();
+            extractIssuerFromTokens(tokenSet.idToken, tokenSet.accessToken) ?? oidcIssuer.trim();
 
           let discoveredPodUrl = defaultPodUrl;
           const verifiedProfile = await fetchWebIdProfile(webId, { fetchFn });
@@ -369,7 +887,8 @@ export function WolinProvider({
             webId: verifiedProfile.webId,
             accessToken: tokenSet.accessToken,
             tokenType: normalizedTokenType,
-            dpopKeyPair: pending.dpopKeyPair,
+            dpopKeyPair,
+            dpopJkt: dpopKeyPair.jkt,
             idToken: tokenSet.idToken,
             refreshToken: tokenSet.refreshToken,
             expiresAt: tokenSet.expiresAt,
@@ -407,7 +926,7 @@ export function WolinProvider({
 
   const logout = useCallback(() => {
     authEpochRef.current += 1;
-    pendingAuthRef.current = null;
+    clearAllPersistedAuthArtifacts();
     inFlightCallbacksRef.current.clear();
     if (mountedRef.current) {
       setProfile(null);

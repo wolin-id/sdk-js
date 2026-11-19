@@ -108,4 +108,67 @@ Builder""" ;
       'https://alice.wolin.id/profile/',
     ]);
   });
+
+  it('extracts wolin:displayName, wolin:avatarGlbUrl, wolin:avatarVrmUrl, and wolin:avatarVariants (IRI and literal)', () => {
+    const iriVariantsTurtle = `
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+@prefix pim: <http://www.w3.org/ns/pim/space#> .
+@prefix solid: <http://www.w3.org/ns/solid/terms#> .
+@prefix wolin: <https://wolin.id/ns#> .
+
+<#me> a foaf:Person ;
+    foaf:name "Alice Full Name" ;
+    wolin:displayName "Alice" ;
+    pim:storage </> ;
+    solid:oidcIssuer <https://auth.wolin.id> ;
+    wolin:avatarGlbUrl </public/avatars/default.glb> ;
+    wolin:avatarVrmUrl <https://cdn.wolin.id/pods/alice/public/avatar.vrm> ;
+    wolin:avatarVariants </public/avatars/variants.json> .
+`;
+    const iriProfile = parseWebIdProfile(iriVariantsTurtle, ALICE_WEBID);
+    expect(iriProfile.name).toBe('Alice Full Name');
+    expect(iriProfile.displayName).toBe('Alice');
+    expect(iriProfile.avatarGlbUrl).toBe('https://alice.wolin.id/public/avatars/default.glb');
+    expect(iriProfile.avatarVrmUrl).toBe('https://cdn.wolin.id/pods/alice/public/avatar.vrm');
+    expect(iriProfile.avatarVariants).toBe('https://alice.wolin.id/public/avatars/variants.json');
+
+    const literalVariantsJson = JSON.stringify({
+      default: {
+        url: 'https://alice.wolin.id/public/avatars/default.vrm',
+        format: 'vrm-1.0',
+        skeleton: 'vrm-1.0',
+        heightMeters: 1.65,
+      },
+      variants: [
+        {
+          app: 'jongno',
+          catalogId: 'jongno-humanoid-v1',
+          skeleton: 'vrm-1.0',
+          heightMeters: 1.8,
+          url: 'https://alice.wolin.id/public/apps/jongno/avatar.vrm',
+        },
+      ],
+    });
+
+    const literalVariantsTurtle = `
+@prefix pim: <http://www.w3.org/ns/pim/space#> .
+@prefix solid: <http://www.w3.org/ns/solid/terms#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix wolin: <https://wolin.id/ns#> .
+
+<#me> wolin:displayName "Wanderer" ;
+    pim:storage </> ;
+    solid:oidcIssuer <https://auth.wolin.id> ;
+    wolin:avatarGlbUrl "https://alice.wolin.id/public/avatar.glb"^^xsd:anyURI ;
+    wolin:avatarVrmUrl "https://alice.wolin.id/public/avatar.vrm"^^xsd:anyURI ;
+    wolin:avatarVariants '''${literalVariantsJson}''' .
+`;
+    const literalProfile = parseWebIdProfile(literalVariantsTurtle, ALICE_WEBID);
+    expect(literalProfile.displayName).toBe('Wanderer');
+    expect(literalProfile.name).toBe('Wanderer');
+    expect(literalProfile.avatarGlbUrl).toBe('https://alice.wolin.id/public/avatar.glb');
+    expect(literalProfile.avatarVrmUrl).toBe('https://alice.wolin.id/public/avatar.vrm');
+    expect(literalProfile.avatarVariants).toBe(literalVariantsJson);
+    expect(JSON.parse(literalProfile.avatarVariants!).variants[0].app).toBe('jongno');
+  });
 });
